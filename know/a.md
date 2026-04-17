@@ -1241,10 +1241,281 @@ class SessionSource:
 `build_session_context_prompt()` 将 `SessionContext` 注入系统提示，让 Agent 知道当前平台、可用投递目标等上下文。支持 PII 脱敏（WhatsApp/Signal/Telegram/BlueBubbles 平台的 user_id 哈希化）。
 
 
+第八章 定时任务调度系统
+8.1 Cron系统概述
+Hermes的Cron系统是实现自动化任务执行的核心组件，由cron/目录下的多个模块组成。调度器的Tick周期是Cron系统的核心工作机制，决定了任务执行的精确度和系统资源的利用率[24]。
+核心组件架构：
+![img_11.png](img_11.png)
+关键文件职责：
+● cron/jobs.py：任务模型定义、JSON序列化和原子读写
+● cron/scheduler.py：Tick循环、到期任务检测、执行调度
+● tools/cronjob_tools.py：面向AIAgent的cronjob工具注册和处理
+## 9. Cron 调度系统
 
+> 代码位置：`cron/jobs.py`（任务存储、调度解析）、`cron/scheduler.py`（Tick 循环、执行调度）
 
+### 9.1 架构概述
 
+| 文件 | 职责 |
+|------|------|
+| `cron/jobs.py` | 任务 CRUD、`parse_schedule()`、`create_job()`、原子 JSON 读写 |
+| `cron/scheduler.py` | `tick()` 循环、文件锁、到期检测、Agent 执行、投递路由 |
+| `tools/cronjob_tools.py` | 面向 AIAgent 的 `cronjob` 工具注册 |
 
+存储路径：`~/.hermes/cron/jobs.json`（任务定义）、`~/.hermes/cron/output/{job_id}/{timestamp}.md`（输出）
 
+### 9.2 调度格式
 
+> 代码位置：`cron/jobs.py` → `parse_schedule()`
+
+```python
+def parse_schedule(schedule: str) -> Dict[str, Any]:
+    """返回 {"kind": "once"|"interval"|"cron", ...}"""
+    # "every 30m"       → {"kind": "interval", "minutes": 30}
+    # "30m" / "2h"      → {"kind": "once", "run_at": ISO时间戳}
+    # "0 9 * * *"       → {"kind": "cron", "expr": "0 9 * * *"}（需 croniter）
+    # "2026-04-15T09:00" → {"kind": "once", "run_at": ISO时间戳}
+```
+
+| 格式 | 示例 | 行为 |
+|------|------|------|
+| 相对延迟 | `30m`, `2h`, `1d` | 一次性 |
+| 间隔 | `every 30m`, `every 2h` | 重复触发 |
+| Cron 表达式 | `0 9 * * *` | 标准 5 字段 cron |
+| ISO 格式 | `2026-04-15T09:00:00` | 一次性 |
+
+### 9.3 任务创建
+
+> 代码位置：`cron/jobs.py` → `create_job()`
+
+```python
+def create_job(
+    prompt: str, schedule: str,
+    name: Optional[str] = None,
+    repeat: Optional[int] = None,       # None=永久, 1=一次
+    deliver: Optional[str] = None,      # "origin"|"local"|"telegram:123456"
+    origin: Optional[Dict] = None,      # 创建来源（用于 origin 投递）
+    skill: Optional[str] = None,        # 旧版单技能
+    skills: Optional[List[str]] = None, # 多技能列表
+    model: Optional[str] = None,        # 每任务模型覆盖
+    script: Optional[str] = None,       # 预执行 Python 脚本
+) -> Dict[str, Any]:
+    # auto-set repeat=1 for one-shot schedules
+    # default deliver to "origin" if origin available, else "local"
+```
+
+### 9.4 Tick 执行流程
+
+> 代码位置：`cron/scheduler.py` → `tick()`
+
+![img_14.png](img_14.png)
+
+```python
+def tick(verbose=True, adapters=None, loop=None) -> int:
+    """网关每 60 秒调用一次（真实代码）"""
+    # 1. 跨平台文件锁（fcntl Unix / msvcrt Windows）
+    lock_fd = open(_LOCK_FILE, "w")
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # 非阻塞
+
+    # 2. 获取到期任务
+    due_jobs = get_due_jobs()
+
+    for job in due_jobs:
+        # 3. 重复任务：执行前先推进 next_run_at（崩溃安全）
+        advance_next_run(job["id"])
+        # 4. 执行任务（创建 AIAgent + 注入技能 + 运行对话）
+        success, output, final_response, error = run_job(job)
+        # 5. 保存输出
+        save_job_output(job["id"], output)
+        # 6. 投递结果（支持 [SILENT] 标记静默跳过）
+        if not final_response.startswith(SILENT_MARKER):
+            _deliver(job, final_response, adapters, loop)
+```
+
+### 9.5 投递路由
+
+> 代码位置：`cron/scheduler.py` → `_resolve_delivery_target()`
+
+```python
+# 支持的投递格式
+"local"                        # 仅保存到本地文件
+"origin"                       # 创建任务的同一聊天（回退到 home channel）
+"telegram"                     # 平台 home channel
+"telegram:-1001234567890"      # 指定聊天 ID
+"discord:123456789"
+"email:user@example.com"
+```
+
+已知投递平台（`_KNOWN_DELIVERY_PLATFORMS`）：telegram、discord、slack、whatsapp、signal、matrix、mattermost、dingtalk、feishu、wecom、email、sms、webhook、bluebubbles、qqbot 等 17 个。
+
+### 9.6 脚本支持
+
+`script` 参数允许 Python 脚本在 Agent 执行前运行，stdout 注入为上下文。典型用途：网站变更检测、数据收集。
+
+```python
+# 用例示例
+/cron add "every 1h" "If CHANGE DETECTED, summarize" --script="~/.hermes/scripts/watch.py"
+```
+
+---
+
+## 10. 安全与隐私机制
+
+### 10.1 危险命令审批
+
+> 代码位置：`tools/approval.py`（单一真实来源）
+
+```python
+"""模块职责（真实文档字符串）：
+- Pattern detection (DANGEROUS_PATTERNS, detect_dangerous_command)
+- Per-session approval state (thread-safe, keyed by session_key)
+- Approval prompting (CLI interactive + gateway async)
+- Smart approval via auxiliary LLM (auto-approve low-risk commands)
+- Permanent allowlist persistence (config.yaml)
+"""
+```
+
+**审批模式：**
+
+| 模式 | 行为 |
+|------|------|
+| `ask` | 所有匹配模式的命令都需人工审批 |
+| `smart` | 辅助 LLM 评估风险，低风险自动放行 |
+| `off` | 无检查 |
+
+**`DANGEROUS_PATTERNS`（部分，真实代码）：**
+
+```python
+DANGEROUS_PATTERNS = [
+    (r'\brm\s+(-[^\s]*\s+)*/', "delete in root path"),
+    (r'\brm\s+-[^\s]*r', "recursive delete"),
+    (r'\bchmod\s+(-[^\s]*\s+)*(777|666|o\+[rwx]*w)\b', "world-writable permissions"),
+    (r'\bDROP\s+(TABLE|DATABASE)\b', "SQL DROP"),
+    (r'\b(curl|wget)\b.*\|\s*(ba)?sh\b', "pipe remote content to shell"),
+    (r'\bgit\s+push\b.*--force\b', "git force push"),
+    (r'\bgit\s+reset\s+--hard\b', "git reset --hard"),
+    (r'\bhermes\s+gateway\s+(stop|restart)\b', "stop/restart gateway"),
+    (r'\b(pkill|killall)\b.*\b(hermes|gateway)\b', "self-termination"),
+    # ... 共 30+ 条模式
+]
+```
+
+**会话级审批状态**使用 `contextvars.ContextVar` 实现线程安全（网关并发执行 Agent 时避免竞态）。
+
+### 10.2 凭证脱敏
+
+> 代码位置：`agent/redact.py`
+
+```python
+# 导入时快照，防止运行时 LLM 通过 export 禁用脱敏
+_REDACT_ENABLED = os.getenv("HERMES_REDACT_SECRETS", "").lower() not in ("0", "false", "no", "off")
+
+# 已知 API 密钥前缀（30+ 种，真实代码）
+_PREFIX_PATTERNS = [
+    r"sk-[A-Za-z0-9_-]{10,}",           # OpenAI / Anthropic
+    r"ghp_[A-Za-z0-9]{10,}",            # GitHub PAT
+    r"github_pat_[A-Za-z0-9_]{10,}",    # GitHub fine-grained
+    r"xox[baprs]-[A-Za-z0-9-]{10,}",    # Slack
+    r"AIza[A-Za-z0-9_-]{30,}",          # Google
+    r"AKIA[A-Z0-9]{16}",                # AWS Access Key
+    r"hf_[A-Za-z0-9]{10,}",             # HuggingFace
+    # ... 共 30+ 种前缀
+]
+```
+
+短 token（<18 字符）完全遮蔽，长 token 保留前 6 后 4 字符用于调试。
+
+### 10.3 容器隔离
+
+使用 docker/singularity/modal/daytona 后端时的安全加固（见 7.4 节终端后端表格）。
+
+### 10.4 网关授权
+
+见 8.6 节授权系统。
+
+### 10.5 MCP 凭据处理
+
+```yaml
+mcp_servers:
+  github:
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_TOKEN: ${GITHUB_TOKEN}  # 显式传递，不泄露全部环境变量
+```
+
+Stdio 子进程的环境变量经过过滤，错误消息中的凭证被 `redact.py` 剥离。
+
+---
+
+## 11. 研究与训练工具
+
+### 11.1 批处理轨迹生成
+
+> 代码位置：`batch_runner.py`
+
+```python
+"""Batch Agent Runner（真实文档字符串）
+- 数据集加载和分批
+- multiprocessing 并行处理
+- 检查点（fault tolerance + 断点续跑）
+- 轨迹保存（from/value 格式）
+- 跨批次工具使用统计聚合
+"""
+# 用法
+python batch_runner.py --dataset_file=data.jsonl --batch_size=10 --run_name=my_run
+python batch_runner.py ... --resume      # 断点续跑
+python batch_runner.py ... --distribution=image_gen  # 工具集分布
+```
+
+![img_15.png](img_15.png)
+
+### 11.2 Atropos RL 集成
+
+> 代码位置：`environments/hermes_base_env.py`（`HermesAgentBaseEnv`）
+
+```python
+"""HermesAgentBaseEnv -- Atropos 集成基类（真实文档字符串）
+两种运行模式：
+  - Phase 1: OpenAI server（在线推理）
+  - Phase 2: VLLM ManagedServer（批量训练）
+
+子类需实现：
+  setup()          -- 加载数据集
+  get_next_item()  -- 返回下一个数据项
+  format_prompt()  -- 转换为用户消息
+  compute_reward() -- 评分（可访问 ToolContext）
+  evaluate()       -- 周期性评估
+"""
+```
+
+**工具调用解析器**（`environments/tool_call_parsers/`）— 11 种模型格式：
+hermes、deepseek_v3、deepseek_v3_1、glm45、glm47、kimi_k2、llama、longcat、mistral、qwen、qwen3_coder
+
+### 11.3 轨迹压缩
+
+> 代码位置：`trajectory_compressor.py`
+
+```python
+"""Trajectory Compressor（真实文档字符串）
+压缩策略：
+1. 保护首轮（system、human、first gpt、first tool）
+2. 保护末尾 N 轮（最终动作和结论）
+3. 仅压缩中间轮次，从第 2 个 tool response 开始
+4. 按需压缩以适配目标 token 预算
+5. 压缩区域替换为单条 human summary 消息
+6. 保留剩余 tool calls 完整性
+"""
+# 用法
+python trajectory_compressor.py --input=data/my_run --target_max_tokens=16000
+python trajectory_compressor.py --input=data/trajectories.jsonl --sample_percent=15
+```
+
+![img_17.png](img_17.png)
+
+### 11.4 自进化系统
+
+配套项目 `hermes-agent-self-evolution`，使用 DSPy + GEPA（Genetic-Pareto Prompt Evolution）自动优化技能文件、工具描述和系统提示。
+
+![img_18.png](img_18.png)
 

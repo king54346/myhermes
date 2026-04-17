@@ -1499,8 +1499,281 @@ python batch_runner.py ... --distribution=image_gen  # 工具集分布
 """
 ```
 
-**工具调用解析器**（`environments/tool_call_parsers/`）— 11 种模型格式：
-hermes、deepseek_v3、deepseek_v3_1、glm45、glm47、kimi_k2、llama、longcat、mistral、qwen、qwen3_coder
+**工具调用解析器**（`environments/tool_call_parsers/`）— 用于 Phase 2 时从模型原始输出文本中提取结构化 `tool_calls`。每个解析器是对应 VLLM 解析器的独立重实现，无 VLLM 依赖。
+
+**解析器注册表架构：**
+
+```python
+# environments/tool_call_parsers/__init__.py
+class ToolCallParser(ABC):
+    @abstractmethod
+    def parse(self, text: str) -> Tuple[Optional[str], Optional[List[ChatCompletionMessageToolCall]]]:
+        """返回 (content, tool_calls)：content 是去除工具标记后的文本，tool_calls 是解析出的调用列表"""
+
+PARSER_REGISTRY: Dict[str, Type[ToolCallParser]] = {}
+
+@register_parser("hermes")  # 装饰器自动注册到 PARSER_REGISTRY
+class HermesToolCallParser(ToolCallParser): ...
+
+# 使用
+parser = get_parser("hermes")
+content, tool_calls = parser.parse(raw_model_output)
+```
+
+#### 11 种模型的工具调用格式对比
+
+**① Hermes 格式**（hermes）— 也被 Qwen 2.5 复用
+
+```xml
+我来帮你查天气。
+<tool_call>
+{"name": "get_weather", "arguments": {"city": "北京"}}
+</tool_call>
+```
+
+- 用 `<tool_call>` XML 标签包裹 JSON
+- JSON 包含 `name` 和 `arguments` 两个字段
+- 支持未闭合标签（模型输出被截断时）
+- **Qwen 2.5 完全复用此格式**（`QwenToolCallParser` 直接继承 `HermesToolCallParser`，零修改）
+
+```python
+# hermes_parser.py — 核心正则
+PATTERN = re.compile(
+    r"<tool_call>\s*(.*?)\s*</tool_call>|<tool_call>\s*(.*)", re.DOTALL
+)
+# 第一组匹配闭合标签，第二组匹配未闭合（截断）
+```
+
+---
+
+**② DeepSeek V3 格式**（deepseek_v3）— 全角 Unicode 特殊 token
+
+```
+我来查一下。
+<｜tool▁calls▁begin｜>
+<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather
+```json
+{"city": "北京"}
+```
+<｜tool▁call▁end｜>
+<｜tool▁calls▁end｜>
+```
+
+- 使用**全角尖括号**（`｜`）和 **Unicode 下划线**（`▁`）作为特殊 token
+- 结构：`calls_begin` 包裹多个 `call_begin...call_end`
+- 每个调用包含 `type`（如 "function"）+ 分隔符 + 函数名 + JSON 代码块
+
+```python
+# deepseek_v3_parser.py — 核心正则
+PATTERN = re.compile(
+    r"<｜tool▁call▁begin｜>(?P<type>.*?)<｜tool▁sep｜>(?P<function_name>.*?)\s*"
+    r"```json\s*(?P<function_arguments>.*?)\s*```\s*<｜tool▁call▁end｜>",
+    re.DOTALL,
+)
+```
+
+---
+
+**③ DeepSeek V3.1 格式**（deepseek_v3_1）— V3 简化版
+
+```
+<｜tool▁calls▁begin｜>
+<｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{"city": "北京"}<｜tool▁call▁end｜>
+<｜tool▁calls▁end｜>
+```
+
+- 与 V3 使用相同的特殊 token
+- **区别**：V3 分隔符前是 `type + name`，V3.1 分隔符前是 `name`、后是 `arguments`
+- 无 JSON 代码块包裹，无 type 字段
+
+```python
+# deepseek_v3_1_parser.py — 核心正则
+PATTERN = re.compile(
+    r"<｜tool▁call▁begin｜>(?P<function_name>.*?)<｜tool▁sep｜>"
+    r"(?P<function_arguments>.*?)<｜tool▁call▁end｜>",
+    re.DOTALL,
+)
+```
+
+---
+
+**④ GLM 4.5 格式**（glm45）— 非 JSON 的 KV 标签
+
+```xml
+<tool_call>get_weather
+<arg_key>city</arg_key><arg_value>北京</arg_value>
+<arg_key>unit</arg_key><arg_value>celsius</arg_value>
+</tool_call>
+```
+
+- 用 `<tool_call>` 标签，但**不使用 JSON**
+- 参数通过 `<arg_key>/<arg_value>` 标签对表达
+- 值反序列化优先级：`json.loads` → `ast.literal_eval` → 原始字符串
+
+```python
+# glm45_parser.py — 三层正则
+FUNC_CALL_REGEX = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
+FUNC_DETAIL_REGEX = re.compile(r"<tool_call>([^\n]*)\n(.*)</tool_call>", re.DOTALL)
+FUNC_ARG_REGEX = re.compile(r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.DOTALL)
+```
+
+---
+
+**⑤ GLM 4.7 格式**（glm47）— GLM 4.5 变体
+
+继承 GLM 4.5，仅调整正则以处理格式差异：
+
+```python
+# glm47_parser.py — 继承 Glm45ToolCallParser，覆盖两个正则
+FUNC_DETAIL_REGEX = re.compile(r"<tool_call>(.*?)(<arg_key>.*?)?</tool_call>", re.DOTALL)
+FUNC_ARG_REGEX = re.compile(r"<arg_key>(.*?)</arg_key>(?:\\n|\s)*<arg_value>(.*?)</arg_value>", re.DOTALL)
+# 区别：允许 arg_key 和 arg_value 之间有换行符
+```
+
+---
+
+**⑥ Kimi K2 格式**（kimi_k2）— 带函数 ID 索引
+
+```
+<|tool_calls_section_begin|>
+<|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"city": "北京"}<|tool_call_end|>
+<|tool_calls_section_end|>
+```
+
+- 使用 `<|...|>` 风格的特殊 token（ASCII 竖线，非全角）
+- 有 `section_begin/end` 包裹层
+- 函数名格式为 `functions.get_weather:0`（命名空间.函数名:索引）
+- 解析时提取：`"functions.get_weather:0".split(":")[0].split(".")[-1]` → `"get_weather"`
+
+```python
+# kimi_k2_parser.py — 核心正则
+PATTERN = re.compile(
+    r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[^<]+:\d+)\s*"
+    r"<\|tool_call_argument_begin\|>\s*"
+    r"(?P<function_arguments>(?:(?!<\|tool_call_begin\|>).)*?)\s*"
+    r"<\|tool_call_end\|>",
+    re.DOTALL,
+)
+```
+
+---
+
+**⑦ Llama 3.x / 4 格式**（llama3_json / llama4_json）— 纯 JSON 对象
+
+```
+<|python_tag|>{"name": "get_weather", "arguments": {"city": "北京"}}
+```
+
+或不带 `<|python_tag|>` 前缀，直接输出 JSON：
+
+```json
+{"name": "get_weather", "parameters": {"city": "北京"}}
+```
+
+- 最简格式：模型直接输出 JSON 对象
+- 支持 `arguments` 或 `parameters` 作为参数键名
+- 使用 `json.JSONDecoder.raw_decode()` 从混合文本中鲁棒提取 JSON
+- 支持多个 JSON 对象（多工具调用）
+
+```python
+# llama_parser.py — 无固定标签，用 raw_decode 扫描 JSON
+for match in JSON_START.finditer(text):  # 找每个 '{' 的位置
+    obj, json_end = decoder.raw_decode(text[start:])
+    name = obj.get("name")
+    args = obj.get("arguments", obj.get("parameters"))
+```
+
+---
+
+**⑧ Longcat Flash Chat 格式**（longcat）— Hermes 变体
+
+```xml
+<longcat_tool_call>
+{"name": "get_weather", "arguments": {"city": "北京"}}
+</longcat_tool_call>
+```
+
+- 与 Hermes **完全相同的逻辑**，仅标签名从 `<tool_call>` 改为 `<longcat_tool_call>`
+
+---
+
+**⑨ Mistral 格式**（mistral）— 两个版本
+
+**Pre-v11（JSON 数组）：**
+```
+我来查天气。[TOOL_CALLS] [{"name": "get_weather", "arguments": {"city": "北京"}}]
+```
+
+**v11+（name + JSON 拼接）：**
+```
+我来查天气。[TOOL_CALLS]get_weather{"city": "北京"}[TOOL_CALLS]read_file{"path": "/tmp/a.txt"}
+```
+
+- 以 `[TOOL_CALLS]` 作为分隔 token
+- 自动检测版本：`[TOOL_CALLS]` 后面以 `[` 开头 → pre-v11，否则 → v11+
+- Mistral 的工具调用 ID 是 9 字符随机字母数字串（非 UUID）
+
+```python
+# mistral_parser.py — 格式检测
+parts = text.split("[TOOL_CALLS]")
+first_raw = parts[1].strip()
+is_pre_v11 = first_raw.startswith("[") or first_raw.startswith("{")
+# pre-v11: json.loads(first_raw) 解析为数组
+# v11+: 找第一个 '{' 的位置，之前是函数名，之后是参数
+```
+
+---
+
+**⑩ Qwen 2.5 格式**（qwen）— 完全等同 Hermes
+
+```python
+# qwen_parser.py — 零代码，纯继承
+@register_parser("qwen")
+class QwenToolCallParser(HermesToolCallParser):
+    pass  # 与 Hermes 格式完全相同
+```
+
+---
+
+**⑪ Qwen3-Coder 格式**（qwen3_coder）— 嵌套 XML 参数标签
+
+```xml
+<tool_call>
+<function=get_weather>
+<parameter=city>北京</parameter>
+<parameter=unit>celsius</parameter>
+</function>
+</tool_call>
+```
+
+- 最独特的格式：参数不用 JSON，而是用 `<parameter=key>value</parameter>` XML 标签
+- 函数名嵌入在 `<function=name>` 标签属性中
+- 值类型转换：`json.loads` → `ast.literal_eval` → 原始字符串
+
+```python
+# qwen3_coder_parser.py — 三层正则嵌套解析
+TOOL_CALL_REGEX = re.compile(r"<tool_call>(.*?)</tool_call>|<tool_call>(.*?)$", re.DOTALL)
+FUNCTION_REGEX = re.compile(r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL)
+PARAMETER_REGEX = re.compile(r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)", re.DOTALL)
+```
+
+---
+
+**格式总览表：**
+
+| 解析器 | 模型 | 标记风格 | 参数编码 | 特殊点 |
+|--------|------|----------|----------|--------|
+| `hermes` | Hermes / NousResearch | `<tool_call>` XML | JSON `{"name","arguments"}` | 支持截断 |
+| `qwen` | Qwen 2.5 | 同 hermes | 同 hermes | 纯继承，零修改 |
+| `deepseek_v3` | DeepSeek V3 | 全角 Unicode token | JSON 代码块 | 有 type 字段 |
+| `deepseek_v3_1` | DeepSeek V3.1 | 全角 Unicode token | 裸 JSON | 无 type，更简洁 |
+| `glm45` | GLM-4-MoE | `<tool_call>` + `<arg_key/value>` | KV 标签对 | 非 JSON 参数 |
+| `glm47` | GLM 4.7 | 同 glm45 | 同 glm45 | 正则微调 |
+| `kimi_k2` | Kimi K2 | `<\|...\|>` token | 裸 JSON | 函数 ID 索引 |
+| `llama3_json` | Llama 3.x/4 | 无标签/`<\|python_tag\|>` | 纯 JSON 对象 | raw_decode 扫描 |
+| `longcat` | Longcat Flash | `<longcat_tool_call>` | JSON `{"name","arguments"}` | Hermes 变体 |
+| `mistral` | Mistral | `[TOOL_CALLS]` | JSON 数组 / name+JSON | 两个版本自动检测 |
+| `qwen3_coder` | Qwen3-Coder | `<function=name>` XML | `<parameter=k>v` 标签 | 最独特，嵌套 XML |
 
 ### 11.3 轨迹压缩
 
